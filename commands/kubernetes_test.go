@@ -143,7 +143,7 @@ func TestKubernetesKubeconfig(t *testing.T) {
 		kubeconfig := []byte(`i'm some yaml`)
 		tm.kubernetes.On("GetKubeConfig", testCluster.ID).Return(kubeconfig, nil)
 		config.Args = append(config.Args, testCluster.ID)
-		err := RunKubernetesGetKubeconfig(config)
+		err := RunKubernetesKubeconfigPrint(config)
 		assert.NoError(t, err)
 	})
 
@@ -153,7 +153,7 @@ func TestKubernetesKubeconfig(t *testing.T) {
 		tm.kubernetes.On("List").Return(testClusterList, nil)
 		tm.kubernetes.On("GetKubeConfig", testCluster.ID).Return(kubeconfig, nil)
 		config.Args = append(config.Args, testCluster.Name)
-		err := RunKubernetesGetKubeconfig(config)
+		err := RunKubernetesKubeconfigPrint(config)
 		assert.NoError(t, err)
 	})
 }

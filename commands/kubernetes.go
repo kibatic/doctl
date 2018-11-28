@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/digitalocean/doctl"
 	"github.com/digitalocean/doctl/commands/displayers"
@@ -25,7 +26,12 @@ import (
 	"github.com/digitalocean/godo"
 	"github.com/pborman/uuid"
 	"github.com/spf13/cobra"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
+
+const maxAPIFailures = 3
 
 func errNoClusterByName(name string) error {
 	return fmt.Errorf("no cluster goes by the name %q", name)
@@ -65,8 +71,6 @@ func Kubernetes() *Command {
 
 	CmdBuilder(cmd, RunKubernetesGet, "get <id|name>", "get a cluster", Writer, aliasOpt("g"))
 
-	CmdBuilder(cmd, RunKubernetesGetKubeconfig, "kubeconfig <id|name>", "get a cluster's kubeconfig file", Writer, aliasOpt("cfg"))
-
 	CmdBuilder(cmd, RunKubernetesList, "list", "get a list of your clusters", Writer, aliasOpt("ls"))
 
 	cmdKubeClusterCreate := CmdBuilder(cmd, RunKubernetesCreate, "create", "create a cluster", Writer, aliasOpt("c"))
@@ -75,18 +79,40 @@ func Kubernetes() *Command {
 	AddStringFlag(cmdKubeClusterCreate, doctl.ArgClusterVersionSlug, "", "", "cluster version", requiredOpt())
 	AddStringSliceFlag(cmdKubeClusterCreate, doctl.ArgTagNames, "", nil, "cluster tags")
 	AddStringSliceFlag(cmdKubeClusterCreate, doctl.ArgClusterNodePools, "", nil, `cluster node pools in the form "name=your-name;size=droplet_size;count=5;tag=tag1;tag=tag2"`, requiredOpt())
+	AddBoolFlag(cmdKubeClusterCreate, doctl.ArgClusterUpdateKubeconfig, "", true, "whether to add the created cluster to your kubeconfig")
+	AddBoolFlag(cmdKubeClusterCreate, doctl.ArgCommandWait, "", false, "whether to wait for the created cluster become running")
 
 	cmdKubeClusterUpdate := CmdBuilder(cmd, RunKubernetesUpdate, "update <id|name>", "update a cluster's properties", Writer, aliasOpt("u"))
 	AddStringFlag(cmdKubeClusterUpdate, doctl.ArgClusterName, "", "", "cluster name")
 	AddStringSliceFlag(cmdKubeClusterUpdate, doctl.ArgTagNames, "", nil, "cluster tags")
+	AddBoolFlag(cmdKubeClusterUpdate, doctl.ArgClusterUpdateKubeconfig, "", true, "whether to update the cluster in your kubeconfig")
 
 	cmdKubeClusterDelete := CmdBuilder(cmd, RunKubernetesDelete, "delete <id|name>", "delete a cluster", Writer, aliasOpt("d", "rm"))
 	AddBoolFlag(cmdKubeClusterDelete, doctl.ArgForce, doctl.ArgShortForce, false, "Force cluster delete")
+	AddBoolFlag(cmdKubeClusterDelete, doctl.ArgClusterUpdateKubeconfig, "", true, "whether to remove the deleted cluster to your kubeconfig")
+
+	cmd.AddCommand(kubernetesKubeconfig())
 
 	cmd.AddCommand(kubernetesNodePools())
 
 	cmd.AddCommand(kubernetesOptions())
 
+	return cmd
+}
+
+func kubernetesKubeconfig() *Command {
+	cmd := &Command{
+		Command: &cobra.Command{
+			Use:     "kubeconfig",
+			Aliases: []string{"kubecfg", "k8scfg", "config", "cfg"},
+			Short:   "kubeconfig commands",
+			Long:    "kubeconfig commands are used retrieve a cluster's credentials and manipulate them",
+		},
+	}
+
+	CmdBuilder(cmd, RunKubernetesKubeconfigPrint, "print <cluster-id|cluster-name>", "print a cluster's kubeconfig to standard out", Writer, aliasOpt("p", "g"))
+	CmdBuilder(cmd, RunKubernetesKubeconfigSave, "save <cluster-id|cluster-name>", "save a cluster's credentials to your local kubeconfig", Writer, aliasOpt("s"))
+	CmdBuilder(cmd, RunKubernetesKubeconfigRemove, "remove <cluster-id|cluster-name>", "remove a cluster's credentials from your local kubeconfig", Writer, aliasOpt("d", "rm"))
 	return cmd
 }
 
@@ -152,27 +178,6 @@ func RunKubernetesGet(c *CmdConfig) error {
 	return displayClusters(c, *cluster)
 }
 
-// RunKubernetesGetKubeconfig retrieves an existing kubernetes by its identifier.
-func RunKubernetesGetKubeconfig(c *CmdConfig) error {
-	if len(c.Args) != 1 {
-		return doctl.NewMissingArgsErr(c.NS)
-	}
-	clusterID, err := clusterIDize(c.Kubernetes(), c.Args[0])
-	if err != nil {
-		return err
-	}
-
-	kube := c.Kubernetes()
-	kubeconfig, err := kube.GetKubeConfig(clusterID)
-	if err != nil {
-		return err
-	}
-
-	// TODO: better integration with existing kubeconfig file
-	_, err = c.Out.Write(kubeconfig)
-	return err
-}
-
 // RunKubernetesList lists kubernetess.
 func RunKubernetesList(c *CmdConfig) error {
 	kube := c.Kubernetes()
@@ -190,12 +195,31 @@ func RunKubernetesCreate(c *CmdConfig) error {
 	if err := buildClusterCreateRequestFromArgs(c, r); err != nil {
 		return err
 	}
+	wait, err := c.Doit.GetBool(c.NS, doctl.ArgCommandWait)
+	if err != nil {
+		return err
+	}
+	update, err := c.Doit.GetBool(c.NS, doctl.ArgClusterUpdateKubeconfig)
+	if err != nil {
+		return err
+	}
 
 	kube := c.Kubernetes()
 
 	cluster, err := kube.Create(r)
 	if err != nil {
 		return err
+	}
+
+	if update {
+		tryUpdateKubeconfig(kube, cluster.ID)
+	}
+
+	if wait {
+		err = waitForClusterRunning(kube, cluster.ID)
+		if err != nil {
+			warn(fmt.Sprintf("cluster didn't become running: %v", err))
+		}
 	}
 
 	return displayClusters(c, *cluster)
@@ -205,6 +229,10 @@ func RunKubernetesCreate(c *CmdConfig) error {
 func RunKubernetesUpdate(c *CmdConfig) error {
 	if len(c.Args) == 0 {
 		return doctl.NewMissingArgsErr(c.NS)
+	}
+	update, err := c.Doit.GetBool(c.NS, doctl.ArgClusterUpdateKubeconfig)
+	if err != nil {
+		return err
 	}
 	clusterID, err := clusterIDize(c.Kubernetes(), c.Args[0])
 	if err != nil {
@@ -222,13 +250,42 @@ func RunKubernetesUpdate(c *CmdConfig) error {
 		return err
 	}
 
+	if update {
+		tryUpdateKubeconfig(kube, clusterID)
+	}
+
 	return displayClusters(c, *cluster)
+}
+
+func tryUpdateKubeconfig(kube do.KubernetesService, clusterID string) {
+	var (
+		kubeconfig []byte
+		err        error
+	)
+	for tries := 0; ; tries++ {
+		kubeconfig, err = kube.GetKubeConfig(clusterID)
+		if err == nil {
+			break
+		}
+		if tries >= maxAPIFailures {
+			warn(fmt.Sprintf("couldn't get credentials for cluster, it will not be added to your kubeconfig: %v", err))
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if err := writeOrAddToKubeconfig(kubeconfig); err != nil {
+		warn(fmt.Sprintf("couldn't write cluster credentials: %v", err))
+	}
 }
 
 // RunKubernetesDelete deletes a kubernetes by its identifier.
 func RunKubernetesDelete(c *CmdConfig) error {
 	if len(c.Args) != 1 {
 		return doctl.NewMissingArgsErr(c.NS)
+	}
+	update, err := c.Doit.GetBool(c.NS, doctl.ArgClusterUpdateKubeconfig)
+	if err != nil {
+		return err
 	}
 	clusterID, err := clusterIDize(c.Kubernetes(), c.Args[0])
 	if err != nil {
@@ -241,14 +298,90 @@ func RunKubernetesDelete(c *CmdConfig) error {
 	}
 
 	if force || AskForConfirm("delete this Kubernetes cluster") == nil {
-		kube := c.Kubernetes()
-		if err := kube.Delete(clusterID); err != nil {
-			return err
-		}
+		// continue
 	} else {
 		return fmt.Errorf("operation aborted")
 	}
+	kube := c.Kubernetes()
 
+	var kubeconfig []byte
+	if update {
+		// get the cluster's kubeconfig before issuing the delete, so that we can
+		// cleanup the entry from the local file
+		kubeconfig, err = kube.GetKubeConfig(clusterID)
+		if err != nil {
+			warn("couldn't get credentials for cluster, it will not be remove from your kubeconfig")
+		}
+	}
+	if err := kube.Delete(clusterID); err != nil {
+		return err
+	}
+	if kubeconfig != nil {
+		if err := removeFromKubeconfig(kubeconfig); err != nil {
+			warn("Cluster was deleted, but we couldn't remove it from your local kubeconfig. Try doing it manually.")
+		}
+	}
+
+	return nil
+}
+
+// Kubeconfig
+
+// RunKubernetesKubeconfigPrint retrieves an existing kubernetes config and prints it.
+func RunKubernetesKubeconfigPrint(c *CmdConfig) error {
+	if len(c.Args) != 1 {
+		return doctl.NewMissingArgsErr(c.NS)
+	}
+	kube := c.Kubernetes()
+	clusterID, err := clusterIDize(kube, c.Args[0])
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := kube.GetKubeConfig(clusterID)
+	if err != nil {
+		return err
+	}
+	_, err = c.Out.Write(kubeconfig)
+	return err
+}
+
+// RunKubernetesKubeconfigSave retrieves an existing kubernetes config and saves it to your local kubeconfig.
+func RunKubernetesKubeconfigSave(c *CmdConfig) error {
+	if len(c.Args) != 1 {
+		return doctl.NewMissingArgsErr(c.NS)
+	}
+	kube := c.Kubernetes()
+	clusterID, err := clusterIDize(kube, c.Args[0])
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := kube.GetKubeConfig(clusterID)
+	if err != nil {
+		return err
+	}
+	if err := writeOrAddToKubeconfig(kubeconfig); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RunKubernetesKubeconfigRemove retrieves an existing kubernetes config and removes it from your local kubeconfig.
+func RunKubernetesKubeconfigRemove(c *CmdConfig) error {
+	if len(c.Args) != 1 {
+		return doctl.NewMissingArgsErr(c.NS)
+	}
+	kube := c.Kubernetes()
+	clusterID, err := clusterIDize(kube, c.Args[0])
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := kube.GetKubeConfig(clusterID)
+	if err != nil {
+		return err
+	}
+	if err := removeFromKubeconfig(kubeconfig); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -394,7 +527,6 @@ func RunClusterNodePoolDelete(c *CmdConfig) error {
 
 // RunKubeOptionsListVersion deletes a kubernetes by its identifier.
 func RunKubeOptionsListVersion(c *CmdConfig) error {
-
 	kube := c.Kubernetes()
 	versions, err := kube.GetVersions()
 	if err != nil {
@@ -577,6 +709,121 @@ func buildNodePoolUpdateRequestFromArgs(c *CmdConfig, r *godo.KubernetesNodePool
 	r.Tags = tags
 
 	return nil
+}
+
+func writeOrAddToKubeconfig(kubeconfig []byte) error {
+	remote, err := clientcmd.Load(kubeconfig)
+	if err != nil {
+		return err
+	}
+	kubectlDefaults := clientcmd.NewDefaultPathOptions()
+	currentConfig, err := kubectlDefaults.GetStartingConfig()
+	if err != nil {
+		return err
+	}
+	if err := mergeKubeconfig(remote, currentConfig); err != nil {
+		return fmt.Errorf("couldn't use the kubeconfig info received, %v", err)
+	}
+	currentConfig.CurrentContext = remote.CurrentContext
+	return clientcmd.ModifyConfig(kubectlDefaults, *currentConfig, false)
+}
+
+func removeFromKubeconfig(kubeconfig []byte) error {
+	remote, err := clientcmd.Load(kubeconfig)
+	if err != nil {
+		return err
+	}
+	kubectlDefaults := clientcmd.NewDefaultPathOptions()
+	currentConfig, err := kubectlDefaults.GetStartingConfig()
+	if err != nil {
+		return err
+	}
+	if err := removeKubeconfig(remote, currentConfig); err != nil {
+		return fmt.Errorf("couldn't use the kubeconfig info received, %v", err)
+	}
+	return clientcmd.ModifyConfig(kubectlDefaults, *currentConfig, false)
+}
+
+// mergeKubeconfig merges a remote cluster's config file with a local config file,
+// assuming that the current context in the remote config file points to the
+// cluster details to add to the local config.
+func mergeKubeconfig(remote, local *clientcmdapi.Config) error {
+	remoteCtx, ok := remote.Contexts[remote.CurrentContext]
+	if !ok {
+		// this is a bug in the backend, we received incomplete/non-sensical data
+		return fmt.Errorf("the remote config has no context entry named %q. This is a bug, please open a ticket with DigitalOcean!",
+			remote.CurrentContext,
+		)
+	}
+	remoteCluster, ok := remote.Clusters[remoteCtx.Cluster]
+	if !ok {
+		// this is a bug in the backend, we received incomplete/non-sensical data
+		return fmt.Errorf("the remote config has no cluster entry named %q. This is a bug, please open a ticket with DigitalOcean!",
+			remoteCtx.Cluster,
+		)
+	}
+	remoteAuthInfo, ok := remote.AuthInfos[remoteCtx.AuthInfo]
+	if !ok {
+		// this is a bug in the backend, we received incomplete/non-sensical data
+		return fmt.Errorf("the remote config has no user entry named %q. This is a bug, please open a ticket with DigitalOcean!",
+			remoteCtx.AuthInfo,
+		)
+	}
+
+	local.Contexts[remote.CurrentContext] = remoteCtx
+	local.Clusters[remoteCtx.Cluster] = remoteCluster
+	local.AuthInfos[remoteCtx.AuthInfo] = remoteAuthInfo
+	return nil
+}
+
+// removeKubeconfig removes a remote cluster's config file from a local config file,
+// assuming that the current context in the remote config file points to the
+// cluster details to reomve from the local config.
+func removeKubeconfig(remote, local *clientcmdapi.Config) error {
+	remoteCtx, ok := remote.Contexts[remote.CurrentContext]
+	if !ok {
+		// this is a bug in the backend, we received incomplete/non-sensical data
+		return fmt.Errorf("the remote config has no context entry named %q. This is a bug, please open a ticket with DigitalOcean!",
+			remote.CurrentContext,
+		)
+	}
+
+	delete(local.Contexts, remote.CurrentContext)
+	delete(local.Clusters, remoteCtx.Cluster)
+	delete(local.AuthInfos, remoteCtx.AuthInfo)
+	if local.CurrentContext == remote.CurrentContext {
+		local.CurrentContext = ""
+	}
+	return nil
+}
+
+// waitForClusterRunning waits for a cluster to be running.
+func waitForClusterRunning(kube do.KubernetesService, clusterID string) error {
+	failCount := 0
+	for {
+		cluster, err := kube.Get(clusterID)
+		if err != nil {
+			if failCount >= maxAPIFailures {
+				return err
+			}
+			// tolerate transient API failures
+			time.Sleep(time.Second)
+		} else {
+			failCount = 0 // API responded, reset it's error counter
+		}
+		if cluster.Status == nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		switch cluster.Status.State {
+		case godo.KubernetesClusterStatusRunning:
+			return nil
+		case godo.KubernetesClusterStatusProvisioning:
+			time.Sleep(5 * time.Second)
+		default:
+			return fmt.Errorf("unknown status: [%s]", cluster.Status.State)
+		}
+	}
 }
 
 func displayClusters(c *CmdConfig, clusters ...do.KubernetesCluster) error {
